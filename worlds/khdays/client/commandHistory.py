@@ -9,15 +9,8 @@ import Utils
 from zipfile import ZipFile, ZIP_DEFLATED
 from ..Options import charRando, goalChoice
 from ..Items import Bundles, item_dictionary_table
-from .NativeBridge import NativeBridge
 from .APMessages import MessageText, messagePacket
 class Commands(ClientCommandProcessor):  
-    @mark_raw
-    def _cmd_native(self, directory=""):
-        """Connect to the Lua mod: /native <port saves/mods/archipelago.khdays directory>."""
-        if directory:
-            asyncio.create_task(self.connect(directory.strip().strip('"')))
-
     @mark_raw
     def _cmd_tcp(self, text=""):
         """Send hex bytes to MelonMix, such as /tcp 48 26."""
@@ -67,17 +60,12 @@ class Commands(ClientCommandProcessor):
             self.ctx.streams = None
             self.ctx.connectionStatus = False
 
-    async def connect(self, native_directory=None):
+    async def connect(self):
         try:
             if self.ctx.streams is not None:
                 self.ctx.streams[1].close()
                 await self.ctx.task
-            if native_directory is None:
-                self.ctx.streams = await asyncio.open_connection("127.0.0.1", 43050)
-            else:
-                bridge = NativeBridge(native_directory)
-                await asyncio.wait_for(bridge.wait_for_acknowledgement(), timeout=30)
-                self.ctx.streams = bridge, bridge
+            self.ctx.streams = await asyncio.open_connection("127.0.0.1", 43050)
             reader,writer = self.ctx.streams
             self.ctx.task = asyncio.create_task(self.listen(reader))
             self.ctx.connectionStatus = True
@@ -92,7 +80,7 @@ class Commands(ClientCommandProcessor):
             asyncio.create_task(self.ctx.sendCharRandoSetting())
 
             
-            self.output("Native Lua mod connected" if native_directory else "Melonmix Connected")
+            self.output("Melonmix Connected")
             if self.ctx.chosenChar is not None:
                 asyncio.create_task(self.ctx.chooseChar(self.ctx.chosenChar))
 
@@ -117,7 +105,7 @@ class DaysContext(CommonContext):
             asyncio.create_task(self.sendAPMessage({"parts": parts}))
 
         async def sendAPMessage(self, message):
-            if self.streams is not None and not isinstance(self.streams[1], NativeBridge):
+            if self.streams is not None:
                 await self.send(None, messagePacket(message))
 
         async def server_auth(self, password_requested=False):
@@ -187,8 +175,6 @@ class DaysContext(CommonContext):
             self.slot_data = {}
             self.chosenChar = None;
             self.inventoryDone = asyncio.Event()
-            self.inventoryQuery = None
-            self.completedInventoryQuery = None
             self.starting_mission = None
             self.inventory = {}
             self.debugAPLedger = []
@@ -302,22 +288,13 @@ class DaysContext(CommonContext):
         async def syncInventory(self):
             async with self.item_lock:
                 if self.streams is not None and self.slot_data:
-                    streams = self.streams
                     self.inventoryDone.clear()
                     await self.askInv()
-                    received = False
-                    if isinstance(streams[0], NativeBridge):
-                        expectedInventoryQuery = streams[0].session, streams[0].last_inventory_query_sequence
-                        while self.streams is streams and self.completedInventoryQuery != expectedInventoryQuery:
-                            await asyncio.sleep(0.05)
-                        received = self.streams is streams and self.sendingDone
+                    try:
+                        await asyncio.wait_for(self.inventoryDone.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
                     else:
-                        try:
-                            await asyncio.wait_for(self.inventoryDone.wait(), timeout=5)
-                            received = True
-                        except asyncio.TimeoutError:
-                            pass
-                    if received:
                         await self.checkItemsAndSend()
                         await self.askInv()
         async def game_completed(self):
@@ -333,11 +310,7 @@ class DaysContext(CommonContext):
                 self.misionUnlocked.append(mission)
 
         async def command_handeling(self,opcode,data):
-            if opcode == 0x13:
-                self.inventoryQuery = data[4:].decode("ascii"), int.from_bytes(data[:4], "little")
-            elif opcode == 0x12:
-                asyncio.create_task(self.syncInventory())
-            elif(opcode == 0x07) :
+            if(opcode == 0x07) :
                await self.mission_cleared(data)
             elif(opcode == 0x08):
                 await self.chest_opened(data)
@@ -356,7 +329,6 @@ class DaysContext(CommonContext):
 
                 if inventorySlot == 3:
                     self.sendingDone = True
-                    self.completedInventoryQuery = self.inventoryQuery
                     self.inventoryDone.set()
                     print(self.inventory)
         
